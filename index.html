@@ -1,0 +1,568 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Planets</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root { --hud-bg: rgba(0,0,0,0.35); --hud-text: #fff; }
+    html,body{height:100%;margin:0}
+    body{
+      background: radial-gradient(circle at 50% 40%, #071028 0%, #020617 70%);
+      font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+      color:var(--hud-text);
+      overflow:hidden;
+    }
+    canvas{display:block;width:100%;height:100%;cursor:crosshair}
+    .hud{
+      position:fixed; left:12px; top:12px;
+      background:var(--hud-bg); padding:8px 10px; border-radius:10px;
+      font-size:13px; backdrop-filter: blur(6px);
+    }
+    .hint{opacity:.85;font-size:12px;margin-top:6px}
+    .small{font-size:11px;opacity:.8}
+  </style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+  <div class="hud" id="hud">Planets: 0 <div class="hint small">Click to spawn • Auto-spawn every few seconds</div></div>
+
+<script>
+(() => {
+  // ---- Canvas setup --------------------------------------------------
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d', { alpha: true });
+  let DPR = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+  let W = 0, H = 0;
+  function resize(){
+    W = Math.floor(window.innerWidth * DPR);
+    H = Math.floor(window.innerHeight * DPR);
+    canvas.width = W; canvas.height = H;
+    canvas.style.width = window.innerWidth + 'px';
+    canvas.style.height = window.innerHeight + 'px';
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ---- Utilities -----------------------------------------------------
+  const rand = (a,b) => a + Math.random() * (b - a);
+  const clamp = (v,a,b) => Math.max(a, Math.min(b, v));
+  const hypot = (x,y) => Math.hypot(x,y);
+  const finite = v => Number.isFinite(v) ? v : 0;
+
+  // ---- Domains / constants ------------------------------------------
+  const SPECIES = ['A','B','C','D','E','F','G','H'];
+  const SHAPES = ["circle","square","triangle","pentagon","hexagon","star","diamond","oval","cross","randomPolygon"];
+  const PATTERNS = ["solid","gradient","striped","polkadot"];
+  const RING_STYLES = ["solid","dashed","double","glow","colored"];
+  const PLANET_TYPES = ["normal","twinkle","positionColor","proximityColor","lightSource"];
+
+  // ---- helpers for colors / patterns --------------------------------
+  function randomColor(){
+    return { h: (Math.random()*360)|0, s: (Math.random()*101)|0, l: (Math.random()*101)|0 };
+  }
+
+  // ---- per-planet interaction generation -----------------------------
+  // For each planet we store `interactions` object mapping species -> "attract"|"repel"|"none"
+  function makeInteractions(){
+    const out = {};
+    for (const sp of SPECIES){
+      const r = Math.random();
+      if (r < 0.34) out[sp] = "attract";
+      else if (r < 0.68) out[sp] = "repel";
+      else out[sp] = "none";
+    }
+    return out;
+  }
+
+  // ---- planet factory ------------------------------------------------
+  function makePlanet(px, py, r){
+    if (px === undefined) px = rand(60*DPR, W - 60*DPR);
+    if (py === undefined) py = rand(60*DPR, H - 60*DPR);
+    if (r === undefined) r = rand(10*DPR, 38*DPR);
+
+    // speed range wide: very slow .. very fast
+    let vx = rand(-6, 6), vy = rand(-6, 6);
+    if (Math.abs(vx) < 0.06) vx = vx < 0 ? -0.06 : 0.06;
+    if (Math.abs(vy) < 0.06) vy = vy < 0 ? -0.06 : 0.06;
+
+    // rings: multi-ring with styles
+    const rings = [];
+    while (Math.random() < 0.3) {
+      rings.push({
+        rx: rand(1.4, 2.6),
+        ry: rand(0.45, 1.25),
+        rot: rand(0, Math.PI*2),
+        style: RING_STYLES[(Math.random()*RING_STYLES.length)|0],
+        spin: rand(-0.005, 0.005)
+      });
+    }
+
+    // species and per-planet interactions (unique)
+    const species = SPECIES[(Math.random()*SPECIES.length)|0];
+    const interactions = makeInteractions();
+
+    const type = PLANET_TYPES[(Math.random()*PLANET_TYPES.length)|0];
+
+    return {
+      x: px, y: py, vx, vy,
+      r, m: r*r,
+      color: randomColor(),
+      rings,
+      shape: SHAPES[(Math.random()*SHAPES.length)|0],
+      pattern: PATTERNS[(Math.random()*PATTERNS.length)|0],
+      angle: rand(0, Math.PI*2),
+      rotationSpeed: rand(-0.02, 0.02),
+      sides: 5 + ((Math.random()*5)|0),
+      planetType: type,
+      lightRadius: (type === "lightSource") ? rand(100*DPR, 240*DPR) : 0,
+      slowCounter: 0,
+      species,
+      interactions
+    };
+  }
+
+  // ---- drawing utilities ---------------------------------------------
+  // Build fill from baseColor depending on pattern
+  function getDynamicColor(p, planets){
+    // base color may be modified by type: twinkle, positionColor, proximityColor
+    let base = {...p.color};
+    if (p.planetType === "twinkle") {
+      const flick = Math.sin(Date.now()/200 + p.x*0.005) * 18;
+      base.l = clamp(base.l + flick, 0, 100);
+    } else if (p.planetType === "positionColor") {
+      base.h = Math.floor((p.x / W) * 360);
+      base.s = 70;
+      base.l = 48 + Math.floor(Math.sin(p.y / (40*DPR)) * 18);
+    } else if (p.planetType === "proximityColor" && planets.length > 1) {
+      let nearest = null, md = Infinity;
+      for (const q of planets) {
+        if (q === p) continue;
+        const d = Math.hypot(q.x - p.x, q.y - p.y);
+        if (d < md) { md = d; nearest = q; }
+      }
+      if (nearest) {
+        const a = 0.06; // blend small step
+        base.h = (1-a)*base.h + a*nearest.color.h;
+        base.s = (1-a)*base.s + a*nearest.color.s;
+        base.l = (1-a)*base.l + a*nearest.color.l;
+      }
+    }
+    return base;
+  }
+
+  function createPatternFromColor(baseColor, pattern){
+    if (pattern === "solid") {
+      return `hsl(${baseColor.h}, ${baseColor.s}%, ${baseColor.l}%)`;
+    }
+    if (pattern === "gradient") {
+      // radial gradient
+      const g = ctx.createRadialGradient(0,0, 2, 0,0, 60);
+      g.addColorStop(0, `hsl(${baseColor.h}, ${baseColor.s}%, ${clamp(baseColor.l+18,0,100)}%)`);
+      g.addColorStop(1, `hsl(${(baseColor.h+80)%360}, ${baseColor.s}%, ${clamp(baseColor.l-18,0,100)}%)`);
+      return g;
+    }
+    if (pattern === "striped") {
+      const pc = document.createElement('canvas');
+      pc.width = 8; pc.height = 8;
+      const pg = pc.getContext('2d');
+      pg.fillStyle = `hsl(${baseColor.h}, ${baseColor.s}%, ${baseColor.l}%)`;
+      pg.fillRect(0,0,8,8);
+      pg.strokeStyle = `hsl(${(baseColor.h+180)%360}, ${baseColor.s}%, ${baseColor.l}%)`;
+      pg.lineWidth = 3;
+      pg.beginPath(); pg.moveTo(0,0); pg.lineTo(8,8); pg.stroke();
+      return ctx.createPattern(pc, "repeat");
+    }
+    if (pattern === "polkadot") {
+      const pc = document.createElement('canvas');
+      pc.width = 12; pc.height = 12;
+      const pg = pc.getContext('2d');
+      pg.fillStyle = `hsl(${baseColor.h}, ${baseColor.s}%, ${baseColor.l}%)`;
+      pg.fillRect(0,0,12,12);
+      pg.fillStyle = `hsl(${(baseColor.h+180)%360}, ${baseColor.s}%, ${clamp(100-baseColor.l, 0, 100)}%)`;
+      pg.beginPath(); pg.arc(6,6,3,0,Math.PI*2); pg.fill();
+      return ctx.createPattern(pc, "repeat");
+    }
+    return `hsl(${baseColor.h}, ${baseColor.s}%, ${baseColor.l}%)`;
+  }
+
+  function drawShapePath(p){
+    ctx.beginPath();
+    if (p.shape === "circle") {
+      ctx.arc(0,0,p.r,0,Math.PI*2);
+    } else if (p.shape === "square") {
+      ctx.rect(-p.r, -p.r, p.r*2, p.r*2);
+    } else if (p.shape === "triangle") {
+      ctx.moveTo(0, -p.r);
+      ctx.lineTo(p.r, p.r);
+      ctx.lineTo(-p.r, p.r);
+      ctx.closePath();
+    } else if (p.shape === "pentagon" || p.shape === "hexagon" || p.shape === "randomPolygon") {
+      let sides = p.shape === "pentagon" ? 5 : (p.shape === "hexagon" ? 6 : p.sides);
+      for (let i=0;i<sides;i++){
+        const a = (i * 2 * Math.PI) / sides - Math.PI/2;
+        const X = p.r * Math.cos(a), Y = p.r * Math.sin(a);
+        if (i===0) ctx.moveTo(X,Y); else ctx.lineTo(X,Y);
+      }
+      ctx.closePath();
+    } else if (p.shape === "star") {
+      const spikes = 5, outer = p.r, inner = p.r * 0.5;
+      for (let i=0;i<spikes*2;i++){
+        const rad = (i * Math.PI) / spikes - Math.PI/2;
+        const radius = (i%2===0) ? outer : inner;
+        const X = radius * Math.cos(rad), Y = radius * Math.sin(rad);
+        if (i===0) ctx.moveTo(X,Y); else ctx.lineTo(X,Y);
+      }
+      ctx.closePath();
+    } else if (p.shape === "diamond") {
+      ctx.moveTo(0, -p.r); ctx.lineTo(p.r, 0); ctx.lineTo(0, p.r); ctx.lineTo(-p.r,0); ctx.closePath();
+    } else if (p.shape === "oval") {
+      ctx.ellipse(0,0,p.r*1.5,p.r,0,0,Math.PI*2);
+    } else if (p.shape === "cross") {
+      const s = p.r;
+      ctx.moveTo(-s*0.3,-s); ctx.lineTo(s*0.3,-s); ctx.lineTo(s*0.3,-s*0.3); ctx.lineTo(s,-s*0.3);
+      ctx.lineTo(s,s*0.3); ctx.lineTo(s*0.3,s*0.3); ctx.lineTo(s*0.3,s); ctx.lineTo(-s*0.3,s);
+      ctx.lineTo(-s*0.3,s*0.3); ctx.lineTo(-s,s*0.3); ctx.lineTo(-s,-s*0.3); ctx.lineTo(-s*0.3,-s*0.3);
+      ctx.closePath();
+    }
+  }
+
+  function drawPlanet(p, planets){
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.rotate(p.angle);
+
+    const baseColor = getDynamicColor(p, planets);
+    const fill = createPatternFromColor(baseColor, p.pattern);
+    ctx.fillStyle = fill;
+    drawShapePath(p);
+    ctx.fill();
+
+    // rings (with style variations)
+    for (const ring of p.rings){
+      ctx.save();
+      if (ring.style === "dashed") ctx.setLineDash([6*DPR, 4*DPR]);
+      if (ring.style === "colored") ctx.strokeStyle = `hsl(${(p.color.h+90)%360}, 90%, 70%)`;
+      else ctx.strokeStyle = "rgba(255,255,255,0.55)";
+      if (ring.style === "glow"){
+        ctx.shadowBlur = 14 * DPR;
+        ctx.shadowColor = `hsl(${p.color.h}, 90%, 70%)`;
+        ctx.strokeStyle = `hsla(${p.color.h}, 90%, 80%, 0.92)`;
+      }
+      ctx.lineWidth = Math.max(1, 1.6 * DPR);
+      ctx.beginPath();
+      ctx.ellipse(0, 0, p.r * ring.rx, p.r * ring.ry, ring.rot, 0, Math.PI*2);
+      ctx.stroke();
+      if (ring.style === "double"){
+        ctx.beginPath();
+        ctx.ellipse(0, 0, p.r * ring.rx * 0.88, p.r * ring.ry * 0.88, ring.rot, 0, Math.PI*2);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    ctx.restore();
+
+    // optionally, draw tiny border for small shapes to increase readability
+  }
+
+  function drawGlow(p){
+    if (p.planetType !== "lightSource") return;
+    const g = ctx.createRadialGradient(p.x, p.y, p.r*0.6, p.x, p.y, p.lightRadius);
+    g.addColorStop(0, `hsla(${p.color.h}, ${p.color.s}%, 85%, 0.45)`);
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.lightRadius, 0, Math.PI*2);
+    ctx.fill();
+  }
+
+  // ---- Simulation state ----------------------------------------------
+  const hud = document.getElementById('hud');
+  let planets = Array.from({length:16}, () => makePlanet());
+  let lastTick = performance.now();
+
+  // ---- spawn scheduling ---------------------------------------------
+  function scheduleSpawn(){
+    const delay = rand(4000, 14000);
+    setTimeout(() => {
+      planets.push(makePlanet());
+      scheduleSpawn();
+    }, delay);
+  }
+  scheduleSpawn();
+
+  // manual spawn on click
+  canvas.addEventListener('click', (ev) => {
+    const rect = canvas.getBoundingClientRect();
+    const x = (ev.clientX - rect.left) * DPR;
+    const y = (ev.clientY - rect.top) * DPR;
+    planets.push(makePlanet(x, y));
+  });
+
+  // ---- physics / collision helpers ----------------------------------
+  function colorSimilar(c1, c2){
+    // hue wrap-around aware difference
+    const dh = Math.abs(((c1.h - c2.h + 540) % 360) - 180);
+    return dh < 28; // threshold
+  }
+
+  function capSpeed(p, max = 14 * DPR){
+    const s = Math.hypot(p.vx, p.vy);
+    if (s > max) {
+      const k = max / s;
+      p.vx *= k; p.vy *= k;
+    }
+  }
+
+  // ---- main loop ----------------------------------------------------
+  function step(){
+    const now = performance.now();
+    const dt = Math.min(33, now - lastTick); // ms
+    lastTick = now;
+
+    // clear
+    ctx.clearRect(0,0,W,H);
+
+    // --- gravity phase: each planet checks a few other planets and applies
+    // interaction according to its OWN interactions mapping to target species.
+    for (const p of planets) {
+      // small chance to choose multiple targets; loop a few times is fine
+      const tries = 1 + ((Math.random() < 0.12) ? 1 : 0);
+      for (let t = 0; t < tries; t++){
+        if (planets.length < 2) break;
+        const q = planets[(Math.random()*planets.length)|0];
+        if (!q || q === p) continue;
+        const rule = p.interactions[q.species]; // per-planet rule
+        if (!rule || rule === "none") continue;
+
+        let dx = q.x - p.x, dy = q.y - p.y;
+        let dist2 = dx*dx + dy*dy + 1e-6;
+        // softening and scaling
+        let F = (0.045 * q.m) / dist2;
+        if (rule === "repel") F = -F; // reverse direction for repulsion
+        const inv = 1 / Math.sqrt(dist2);
+        p.vx += (F * dx * inv);
+        p.vy += (F * dy * inv);
+      }
+    }
+
+    // --- integrate position + friction + occasional random speed reset
+    for (const p of planets){
+      p.x += p.vx * (dt/16);
+      p.y += p.vy * (dt/16);
+      p.angle += p.rotationSpeed * (dt/16);
+
+      // friction/loss -> speed tends to decrease slowly
+      p.vx *= 0.996;
+      p.vy *= 0.996;
+
+      p.slowCounter = (p.slowCounter || 0) + 1;
+      if (p.slowCounter > 600 && Math.random() < 0.012) {
+        // reset to a new random speed occasionally so system doesn't stagnate
+        p.vx = rand(-6,6); p.vy = rand(-6,6);
+        p.slowCounter = 0;
+      }
+
+      // keep inside canvas
+      if (p.x < p.r) { p.x = p.r; p.vx = Math.abs(p.vx); }
+      if (p.x > W - p.r) { p.x = W - p.r; p.vx = -Math.abs(p.vx); }
+      if (p.y < p.r) { p.y = p.r; p.vy = Math.abs(p.vy); }
+      if (p.y > H - p.r) { p.y = H - p.r; p.vy = -Math.abs(p.vy); }
+
+      // sanitize numeric values
+      if (!Number.isFinite(p.x)) p.x = rand(40, W-40);
+      if (!Number.isFinite(p.y)) p.y = rand(40, H-40);
+      if (!Number.isFinite(p.vx)) p.vx = rand(-1,1);
+      if (!Number.isFinite(p.vy)) p.vy = rand(-1,1);
+      capSpeed(p);
+      // rotate rings a bit
+      for (const ring of p.rings) ring.rot += ring.spin || 0;
+    }
+
+	// --- giant explosion chance ---
+	const explosionAdds = [];
+	const explosionRemoves = [];
+	for (let idx=0; idx<planets.length; idx++){
+	  const p = planets[idx];
+	  if (p.r > 80*DPR && Math.random() < 0.002) { // 0.2% chance per frame
+		// explode
+		const num = 5 + ((Math.random()*8)|0); // 5–12 new planets
+		for (let k=0; k<num; k++){
+		  const angle = Math.random() * Math.PI * 2;
+		  const dist = rand(5*DPR, p.r*0.6);
+		  const child = makePlanet(p.x + Math.cos(angle)*dist,
+								   p.y + Math.sin(angle)*dist,
+								   rand(4*DPR, 12*DPR));
+		  child.vx += Math.cos(angle) * rand(1, 4);
+		  child.vy += Math.sin(angle) * rand(1, 4);
+		  explosionAdds.push(child);
+		}
+		explosionRemoves.push(idx);
+	  }
+	}
+	// remove exploded big planets
+	for (const i of explosionRemoves.sort((a,b)=>b-a)) planets.splice(i,1);
+	if (explosionAdds.length) planets.push(...explosionAdds);
+
+
+    // --- collision detection & resolution ---
+    const toRemove = new Set();
+    const toAdd = [];
+
+    for (let i = 0; i < planets.length; i++){
+      for (let j = i+1; j < planets.length; j++){
+        if (toRemove.has(i) || toRemove.has(j)) continue;
+        const a = planets[i], b = planets[j];
+        let dx = b.x - a.x, dy = b.y - a.y;
+        let dist = Math.hypot(dx, dy);
+        if (dist < (a.r + b.r) && dist > 0) {
+          // avoid zero-dist pathology
+          // Push small separation to avoid sticking
+          const overlap = (a.r + b.r) - dist;
+          const nx = dx / dist, ny = dy / dist;
+          a.x -= nx * overlap * 0.5;
+          a.y -= ny * overlap * 0.5;
+          b.x += nx * overlap * 0.5;
+          b.y += ny * overlap * 0.5;
+
+          // check color similarity => merge
+          if (colorSimilar(a.color, b.color)) {
+            const M = a.m + b.m;
+            const newR = Math.sqrt(M);
+            const newX = (a.x * a.m + b.x * b.m) / M;
+            const newY = (a.y * a.m + b.y * b.m) / M;
+            const newVX = (a.vx * a.m + b.vx * b.m) / M;
+            const newVY = (a.vy * a.m + b.vy * b.m) / M;
+
+            // choose container (we'll update a and remove b)
+            const keeper = (a.r >= b.r) ? a : b;
+            const removed = (keeper === a) ? b : a;
+
+            keeper.x = newX; keeper.y = newY;
+            keeper.vx = newVX; keeper.vy = newVY;
+            keeper.r = clamp(newR, 4*DPR, 140*DPR);
+            keeper.m = keeper.r * keeper.r;
+
+            // combine properties (weighted/averaged)
+            keeper.color = {
+              h: (a.color.h * a.m + b.color.h * b.m) / (a.m + b.m),
+              s: (a.color.s * a.m + b.color.s * b.m) / (a.m + b.m),
+              l: (a.color.l * a.m + b.color.l * b.m) / (a.m + b.m)
+            };
+
+            // shape/pattern: pick from the two, favor larger
+            if (Math.random() < 0.75) keeper.shape = keeper.shape || (a.r >= b.r ? a.shape : b.shape);
+            else keeper.shape = (Math.random() < 0.5 ? a.shape : b.shape);
+            if (Math.random() < 0.7) keeper.pattern = (Math.random() < 0.5 ? a.pattern : b.pattern);
+
+            // rings: merge arrays (dedupe slightly)
+            keeper.rings = [...(a.rings || []), ...(b.rings || [])];
+
+            // species: keep keeper species (but could be randomized)
+            // interactions: merge by keeping keeper's interactions but sometimes blend
+            if (Math.random() < 0.25) {
+              keeper.interactions = {...keeper.interactions, ...((keeper===a)? b.interactions : a.interactions)};
+            }
+
+            // planetType: if either is lightSource, keep/inherit; else prefer one or keep normal
+            if (a.planetType === "lightSource" || b.planetType === "lightSource") {
+              keeper.planetType = "lightSource";
+              keeper.lightRadius = ((a.lightRadius||0) + (b.lightRadius||0)) / 2 || rand(100*DPR,200*DPR);
+            } else {
+              // attempt to inherit special type occasionally
+              const specials = [a.planetType, b.planetType].filter(t => ["twinkle","positionColor","proximityColor"].includes(t));
+              if (specials.length && Math.random() < 0.45) keeper.planetType = specials[(Math.random()*specials.length)|0];
+            }
+
+            toRemove.add(planets.indexOf(removed));
+          } else {
+            // elastic bounce (1D along normal)
+            const nx2 = dx / dist, ny2 = dy / dist;
+            const rel = (a.vx - b.vx) * nx2 + (a.vy - b.vy) * ny2;
+            if (rel < 0) {
+              const m1 = a.m, m2 = b.m;
+              const impulse = (2 * rel) / (m1 + m2);
+              a.vx -= impulse * m2 * nx2; a.vy -= impulse * m2 * ny2;
+              b.vx += impulse * m1 * nx2; b.vy += impulse * m1 * ny2;
+            }
+
+            // now small chance of property change (20%)
+            if (Math.random() < 0.20) {
+              const target = (Math.random() < 0.5) ? a : b;
+
+              if (Math.random() < 0.8) {
+                // COMBINATION (most likely)
+                target.color = {
+                  h: (a.color.h + b.color.h) / 2,
+                  s: (a.color.s + b.color.s) / 2,
+                  l: (a.color.l + b.color.l) / 2
+                };
+                if (Math.random() < 0.5) target.shape = (Math.random() < 0.5 ? a.shape : b.shape);
+                if (Math.random() < 0.5) target.pattern = (Math.random() < 0.5 ? a.pattern : b.pattern);
+                if (Math.random() < 0.35) target.rings.push(...a.rings, ...b.rings);
+
+                // COMBINE GLOW / LIGHTSOURCE
+                if (a.planetType === "lightSource" || b.planetType === "lightSource") {
+                  target.planetType = "lightSource";
+                  target.lightRadius = ((a.lightRadius||0) + (b.lightRadius||0)) / 2 || rand(100*DPR,200*DPR);
+                }
+
+                // combine special planetType (twinkle, positionColor, proximityColor)
+                const candidateTypes = [a.planetType, b.planetType].filter(t => ["twinkle","positionColor","proximityColor"].includes(t));
+                if (candidateTypes.length > 0 && Math.random() < 0.6) {
+                  target.planetType = candidateTypes[(Math.random()*candidateTypes.length)|0];
+                }
+
+                // interactions: merge preferences conservatively (target keeps own but may adopt some of other's rules)
+                if (Math.random() < 0.35) {
+                  for (const sp of SPECIES) {
+                    if (Math.random() < 0.25) target.interactions[sp] = (a.interactions[sp] === b.interactions[sp]) ? a.interactions[sp] : ((Math.random()<0.5)? a.interactions[sp] : b.interactions[sp]);
+                  }
+                }
+              } else {
+                // RANDOM (rare)
+                const choice = (Math.random()*5)|0;
+                if (choice === 0) target.color = randomColor();
+                if (choice === 1) { target.r = rand(6*DPR, 44*DPR); target.m = target.r * target.r; }
+                if (choice === 2) target.shape = SHAPES[(Math.random()*SHAPES.length)|0];
+                if (choice === 3) target.pattern = PATTERNS[(Math.random()*PATTERNS.length)|0];
+                if (choice === 4) {
+                  for (let k=0;k<2;k++) toAdd.push(makePlanet(target.x + rand(-6,6), target.y + rand(-6,6), rand(4*DPR, 10*DPR)));
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // apply removals and additions
+    if (toRemove.size) {
+      const rm = Array.from(toRemove).sort((a,b) => b - a);
+      for (const idx of rm) {
+        if (idx >= 0 && idx < planets.length) planets.splice(idx, 1);
+      }
+    }
+    if (toAdd.length) planets.push(...toAdd);
+
+    // --- rendering glows then planets
+    // draw glows first (so planets render on top)
+    for (const p of planets) drawGlow(p);
+    for (const p of planets) drawPlanet(p, planets);
+
+    // update HUD
+    hud.firstChild && (hud.firstChild.nodeValue = `Planets: ${planets.length}`);
+
+    requestAnimationFrame(step);
+  }
+
+  requestAnimationFrame(step);
+
+  // expose for debugging in console (optional)
+  window.__sim = { planets, makePlanet, SPECIES };
+
+})();
+</script>
+</body>
+</html>
